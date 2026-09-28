@@ -10,18 +10,65 @@ from docx.shared import Inches
 st.set_page_config(page_title="Email A11y Generator", layout="wide", page_icon="♿")
 
 st.title("♿ Email Accessibility (A11y) Generator")
-st.caption("Generate Deque-compliant Alt Text, ARIA Labels, and export to Word/Google Docs.")
+st.caption("Generate Deque-compliant Alt Text, ARIA Labels, and export directly to Word/Google Docs.")
 
-# --- SIDEBAR: API KEY CONFIGURATION ---
-st.sidebar.header("Configuration")
-api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
+# --- FETCH API KEY FROM STREAMLIT SECRETS ---
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+else:
+    st.error("⚠️ API Key not found! Please configure `GEMINI_API_KEY` in Streamlit App Settings -> Secrets.")
+    st.stop()
+
+# --- MODEL FALLBACK GENERATOR ---
+def generate_a11y_data(api_key, prompt, image):
+    """
+    Tries active Gemini models in order of availability and falls back
+    dynamically if a model identifier is deprecated or missing.
+    """
+    genai.configure(api_key=api_key)
+    
+    candidate_models = [
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemini-1.5-flash',
+        'gemini-1.5-pro-latest',
+        'gemini-1.5-flash-latest'
+    ]
+    
+    last_error = None
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={"response_mime_type": "application/json"}
+            )
+            response = model.generate_content([prompt, image])
+            return response.text, model_name
+        except Exception as e:
+            last_error = e
+            continue
+
+    # Fallback: Query API for any available model supporting content generation
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                model_name = m.name.replace('models/', '')
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config={"response_mime_type": "application/json"}
+                )
+                response = model.generate_content([prompt, image])
+                return response.text, model_name
+    except Exception:
+        pass
+        
+    raise last_error
 
 # --- HELPER FUNCTION: CREATE WORD DOC ---
 def create_word_doc(a11y_data, original_image):
     doc = Document()
     doc.add_heading('Accessibility A11y Documentation', 0)
     
-    # Create Table
     table = doc.add_table(rows=1, cols=5)
     table.style = 'Table Grid'
     hdr_cells = table.rows[0].cells
@@ -31,13 +78,11 @@ def create_word_doc(a11y_data, original_image):
         
     img_width, img_height = original_image.size
     
-    # Populate Rows
     for row_data in a11y_data:
         row_cells = table.add_row().cells
         row_cells[0].text = row_data.get("section", "—")
         row_cells[1].text = row_data.get("description", "—")
         
-        # Handle Image Slicing for Word Doc
         box = row_data.get("box_2d")
         if box and len(box) == 4:
             ymin, xmin, ymax, xmax = box
@@ -48,21 +93,19 @@ def create_word_doc(a11y_data, original_image):
             
             cropped_slice = original_image.crop((left, top, right, bottom))
             
-            # Save slice to memory to insert into Word Doc
             img_stream = io.BytesIO()
             cropped_slice.save(img_stream, format='PNG')
             img_stream.seek(0)
             
             paragraph = row_cells[2].paragraphs[0]
             run = paragraph.add_run()
-            run.add_picture(img_stream, width=Inches(1.2)) # Scale image for Word cell
+            run.add_picture(img_stream, width=Inches(1.2))
         else:
             row_cells[2].text = "—"
             
         row_cells[3].text = row_data.get("alt_text", "n/a")
         row_cells[4].text = row_data.get("aria_label", "n/a")
         
-    # Save document to memory
     doc_stream = io.BytesIO()
     doc.save(doc_stream)
     doc_stream.seek(0)
@@ -81,15 +124,11 @@ with col_right:
         placeholder="e.g.,\n- Hero is an animated GIF\n- Module 2 is a Movable Ink block"
     )
 
-if uploaded_file and api_key:
+if uploaded_file:
     image = Image.open(uploaded_file)
-    img_width, img_height = image.size
+    st.image(image, caption="Uploaded Email Proof", width=300)
     
-    st.divider()
     if st.button("🚀 Generate A11y Table", type="primary"):
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-pro', generation_config={"response_mime_type": "application/json"})
-        
         prompt = f"""
         You are an expert Accessibility (A11y) Specialist. Analyze this email proof and generate data for a strict Deque-compliant A11y table.
 
@@ -112,15 +151,13 @@ if uploaded_file and api_key:
 
         with st.spinner("Analyzing email structure, extracting ARIA labels, and slicing image regions..."):
             try:
-                response = model.generate_content([prompt, image])
-                a11y_data = json.loads(response.text)
+                raw_json, used_model = generate_a11y_data(api_key, prompt, image)
+                a11y_data = json.loads(raw_json)
                 
-                st.success("Analysis Complete!")
+                st.success(f"Analysis Complete (using model: {used_model})!")
                 
-                # --- GENERATE WORD DOC IN BACKGROUND ---
                 word_file = create_word_doc(a11y_data, image)
                 
-                # --- SHOW DOWNLOAD BUTTON ---
                 st.download_button(
                     label="📄 Download as Word Document (Upload to Google Drive)",
                     data=word_file,
@@ -129,12 +166,5 @@ if uploaded_file and api_key:
                     type="primary"
                 )
                 
-                st.subheader("Preview:")
-                for row in a11y_data:
-                    st.write(f"**{row.get('section')}** | {row.get('alt_text')} | {row.get('aria_label')}")
-                    
             except Exception as e:
                 st.error(f"Failed to generate documentation: {str(e)}")
-
-elif not api_key and uploaded_file:
-    st.warning("Please enter your Gemini API Key in the sidebar to proceed.")
