@@ -33,17 +33,27 @@ def parse_gemini_json(text):
     cleaned = cleaned.rstrip('`')
     return json.loads(cleaned)
 
-# --- MODEL FALLBACK GENERATOR ---
+# --- DYNAMIC MODEL GENERATOR ---
 def generate_a11y_data(api_key, prompt, image):
     genai.configure(api_key=api_key)
     
-    # Standard active models
-    candidate_models = [
-        'gemini-1.5-flash',
-        'gemini-1.5-pro',
-        'gemini-2.0-flash'
-    ]
+    candidate_models = []
     
+    # Query API for active models available to this key
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                model_name = m.name.replace('models/', '')
+                if 'flash' in model_name or 'pro' in model_name:
+                    candidate_models.append(model_name)
+    except Exception:
+        pass
+
+    defaults = ['gemini-1.5-flash', 'gemini-1.5-pro']
+    for d in defaults:
+        if d not in candidate_models:
+            candidate_models.append(d)
+
     last_error = None
     for model_name in candidate_models:
         try:
