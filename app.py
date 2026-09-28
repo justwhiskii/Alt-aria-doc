@@ -3,8 +3,15 @@ import google.generativeai as genai
 from PIL import Image
 import json
 import io
-from docx import Document
-from docx.shared import Inches
+import re
+
+# Import docx safely to prevent top-level app crashes
+try:
+    from docx import Document
+    from docx.shared import Inches
+except ImportError:
+    st.error("Missing dependency: `python-docx`. Please add `python-docx` to your requirements.txt file.")
+    st.stop()
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Email A11y Generator", layout="wide", page_icon="♿")
@@ -16,23 +23,25 @@ st.caption("Generate Deque-compliant Alt Text, ARIA Labels, and export directly 
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
-    st.error("⚠️ API Key not found! Please configure `GEMINI_API_KEY` in Streamlit App Settings -> Secrets.")
+    st.error("⚠️ API Key not found! Please add `GEMINI_API_KEY` to Streamlit App Settings -> Secrets.")
     st.stop()
+
+# --- HELPER: CLEAN GEMINI JSON OUTPUT ---
+def parse_gemini_json(text):
+    """Strips Markdown formatting like ```json ... ``` before parsing."""
+    cleaned = re.sub(r'```(?:json)?\n?', '', text).strip()
+    cleaned = cleaned.rstrip('`')
+    return json.loads(cleaned)
 
 # --- MODEL FALLBACK GENERATOR ---
 def generate_a11y_data(api_key, prompt, image):
-    """
-    Tries active Gemini models in order of availability and falls back
-    dynamically if a model identifier is deprecated or missing.
-    """
     genai.configure(api_key=api_key)
     
+    # Standard active models
     candidate_models = [
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
         'gemini-1.5-flash',
-        'gemini-1.5-pro-latest',
-        'gemini-1.5-flash-latest'
+        'gemini-1.5-pro',
+        'gemini-2.0-flash'
     ]
     
     last_error = None
@@ -48,21 +57,7 @@ def generate_a11y_data(api_key, prompt, image):
             last_error = e
             continue
 
-    # Fallback: Query API for any available model supporting content generation
-    try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                model_name = m.name.replace('models/', '')
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    generation_config={"response_mime_type": "application/json"}
-                )
-                response = model.generate_content([prompt, image])
-                return response.text, model_name
-    except Exception:
-        pass
-        
-    raise last_error
+    raise Exception(f"All model attempts failed. Last error: {str(last_error)}")
 
 # --- HELPER FUNCTION: CREATE WORD DOC ---
 def create_word_doc(a11y_data, original_image):
@@ -80,11 +75,11 @@ def create_word_doc(a11y_data, original_image):
     
     for row_data in a11y_data:
         row_cells = table.add_row().cells
-        row_cells[0].text = row_data.get("section", "—")
-        row_cells[1].text = row_data.get("description", "—")
+        row_cells[0].text = str(row_data.get("section", "—"))
+        row_cells[1].text = str(row_data.get("description", "—"))
         
         box = row_data.get("box_2d")
-        if box and len(box) == 4:
+        if box and isinstance(box, list) and len(box) == 4:
             ymin, xmin, ymax, xmax = box
             left = (xmin / 1000.0) * img_width
             top = (ymin / 1000.0) * img_height
@@ -103,8 +98,8 @@ def create_word_doc(a11y_data, original_image):
         else:
             row_cells[2].text = "—"
             
-        row_cells[3].text = row_data.get("alt_text", "n/a")
-        row_cells[4].text = row_data.get("aria_label", "n/a")
+        row_cells[3].text = str(row_data.get("alt_text", "n/a"))
+        row_cells[4].text = str(row_data.get("aria_label", "n/a"))
         
     doc_stream = io.BytesIO()
     doc.save(doc_stream)
@@ -143,7 +138,7 @@ if uploaded_file:
         6. Footers: Group entire text links into a single row.
         7. Visual Bounding Boxes: Provide normalized coordinates [ymin, xmin, ymax, xmax] (0 to 1000 scale).
 
-        Return a JSON array containing objects with these exact keys:
+        Return ONLY a JSON array containing objects with these exact keys:
         [
           {{"section": "...", "description": "...", "box_2d": [ymin, xmin, ymax, xmax], "alt_text": "...", "aria_label": "..."}}
         ]
@@ -151,15 +146,15 @@ if uploaded_file:
 
         with st.spinner("Analyzing email structure, extracting ARIA labels, and slicing image regions..."):
             try:
-                raw_json, used_model = generate_a11y_data(api_key, prompt, image)
-                a11y_data = json.loads(raw_json)
+                raw_response, used_model = generate_a11y_data(api_key, prompt, image)
+                a11y_data = parse_gemini_json(raw_response)
                 
-                st.success(f"Analysis Complete (using model: {used_model})!")
+                st.success(f"Analysis Complete (Model: {used_model})!")
                 
                 word_file = create_word_doc(a11y_data, image)
                 
                 st.download_button(
-                    label="📄 Download as Word Document (Upload to Google Drive)",
+                    label="📄 Download Word Document (Upload to Google Drive)",
                     data=word_file,
                     file_name="A11y_Documentation.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -167,4 +162,4 @@ if uploaded_file:
                 )
                 
             except Exception as e:
-                st.error(f"Failed to generate documentation: {str(e)}")
+                st.error(f"Error during execution: {str(e)}")
