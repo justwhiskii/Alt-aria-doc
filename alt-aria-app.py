@@ -3,17 +3,70 @@ import google.generativeai as genai
 from PIL import Image
 import json
 import io
+from docx import Document
+from docx.shared import Inches
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Email A11y Generator", layout="wide", page_icon="♿")
 
 st.title("♿ Email Accessibility (A11y) Generator")
-st.caption("Generate Deque-compliant Alt Text, ARIA Labels, and auto-cropped Visual Slices from email proofs.")
+st.caption("Generate Deque-compliant Alt Text, ARIA Labels, and export to Word/Google Docs.")
 
 # --- SIDEBAR: API KEY CONFIGURATION ---
 st.sidebar.header("Configuration")
 api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
-st.sidebar.markdown("[Get a free Gemini API Key here](https://aistudio.google.com/)")
+
+# --- HELPER FUNCTION: CREATE WORD DOC ---
+def create_word_doc(a11y_data, original_image):
+    doc = Document()
+    doc.add_heading('Accessibility A11y Documentation', 0)
+    
+    # Create Table
+    table = doc.add_table(rows=1, cols=5)
+    table.style = 'Table Grid'
+    hdr_cells = table.rows[0].cells
+    headers = ['Section of Email', 'Block Description', 'Visual', 'Alt Text', 'ARIA Label']
+    for i, header in enumerate(headers):
+        hdr_cells[i].text = header
+        
+    img_width, img_height = original_image.size
+    
+    # Populate Rows
+    for row_data in a11y_data:
+        row_cells = table.add_row().cells
+        row_cells[0].text = row_data.get("section", "—")
+        row_cells[1].text = row_data.get("description", "—")
+        
+        # Handle Image Slicing for Word Doc
+        box = row_data.get("box_2d")
+        if box and len(box) == 4:
+            ymin, xmin, ymax, xmax = box
+            left = (xmin / 1000.0) * img_width
+            top = (ymin / 1000.0) * img_height
+            right = (xmax / 1000.0) * img_width
+            bottom = (ymax / 1000.0) * img_height
+            
+            cropped_slice = original_image.crop((left, top, right, bottom))
+            
+            # Save slice to memory to insert into Word Doc
+            img_stream = io.BytesIO()
+            cropped_slice.save(img_stream, format='PNG')
+            img_stream.seek(0)
+            
+            paragraph = row_cells[2].paragraphs[0]
+            run = paragraph.add_run()
+            run.add_picture(img_stream, width=Inches(1.2)) # Scale image for Word cell
+        else:
+            row_cells[2].text = "—"
+            
+        row_cells[3].text = row_data.get("alt_text", "n/a")
+        row_cells[4].text = row_data.get("aria_label", "n/a")
+        
+    # Save document to memory
+    doc_stream = io.BytesIO()
+    doc.save(doc_stream)
+    doc_stream.seek(0)
+    return doc_stream
 
 # --- INPUT SECTION ---
 col_left, col_right = st.columns([1, 1])
@@ -25,100 +78,61 @@ with col_right:
     developer_notes = st.text_area(
         "2. Custom Callouts / Build Context", 
         height=150,
-        placeholder="e.g.,\n- Hero is an animated GIF\n- Module 2 is a Movable Ink Creative Optimizer block\n- Footer is live text"
+        placeholder="e.g.,\n- Hero is an animated GIF\n- Module 2 is a Movable Ink block"
     )
 
 if uploaded_file and api_key:
-    # Load Image
     image = Image.open(uploaded_file)
     img_width, img_height = image.size
     
     st.divider()
-    st.subheader("Uploaded Proof Preview")
-    st.image(image, caption=f"Loaded Image ({img_width}x{img_height}px)", width=350)
-    
-    if st.button("🚀 Generate A11y Table & Visual Slices", type="primary"):
-        # Configure Gemini Client
+    if st.button("🚀 Generate A11y Table", type="primary"):
         genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-pro', generation_config={"response_mime_type": "application/json"})
         
-        # Use Gemini 1.5 Pro with forced JSON output
-        model = genai.GenerativeModel(
-            model_name='gemini-1.5-pro',
-            generation_config={"response_mime_type": "application/json"}
-        )
-        
-        # --- SYSTEM PROMPT (Deque Standards + Custom Context) ---
         prompt = f"""
         You are an expert Accessibility (A11y) Specialist. Analyze this email proof and generate data for a strict Deque-compliant A11y table.
 
-        DEVELOPER CALLOUTS / BUILD CONTEXT:
-        {developer_notes if developer_notes else "None provided. Rely solely on visual inspection."}
+        DEVELOPER CALLOUTS: {developer_notes if developer_notes else "None provided."}
 
-        ACCESSIBILITY RULES:
-        1. Decorative Lifestyle Photos: SKIP ROW completely if it is purely a background/lifestyle photo without text or logos. 
-           EXCEPTION: If a lifestyle photo contains incidental text important to the photo or an imposed brand logo, INCLUDE IT with descriptive Alt Text.
+        RULES:
+        1. Decorative Lifestyle Photos: SKIP ROW completely unless it contains incidental text or an imposed brand logo.
         2. Essential Graphics & Logos: Provide clear, descriptive Alt Text.
-        3. ARIA Labels: Must literally match the exact text in the button or link in the exact word order.
-        4. Unclickable Graphics: If an element is a graphic but not a link, set ARIA Label to "n/a - not clickable".
-        5. Dynamic Content (Movable Ink / Creative Optimizer): Group the block into a single row. Set Block Description to "Creative Optimizer", and write generalized Alt/ARIA text that covers dynamic variations.
+        3. ARIA Labels: Must literally match the exact text in the button or link.
+        4. Unclickable Graphics: ARIA Label must be "n/a - not clickable".
+        5. Movable Ink: Group into a single row, set Block Description to "Creative Optimizer", generalized Alt/ARIA text.
         6. Footers: Group entire text links into a single row.
-        7. Visual Bounding Boxes: Provide normalized coordinates `[ymin, xmin, ymax, xmax]` on a scale of 0 to 1000 for each visual row.
+        7. Visual Bounding Boxes: Provide normalized coordinates [ymin, xmin, ymax, xmax] (0 to 1000 scale).
 
         Return a JSON array containing objects with these exact keys:
         [
-          {{
-            "section": "Section Name (e.g. Hero Header, Module 1)",
-            "description": "Block Description (e.g. CTA Button, Creative Optimizer)",
-            "box_2d": [ymin, xmin, ymax, xmax],
-            "alt_text": "Alt Text",
-            "aria_label": "ARIA Label"
-          }}
+          {{"section": "...", "description": "...", "box_2d": [ymin, xmin, ymax, xmax], "alt_text": "...", "aria_label": "..."}}
         ]
         """
 
         with st.spinner("Analyzing email structure, extracting ARIA labels, and slicing image regions..."):
             try:
-                # Query Gemini
                 response = model.generate_content([prompt, image])
                 a11y_data = json.loads(response.text)
                 
                 st.success("Analysis Complete!")
-                st.subheader("Generated Accessibility Documentation")
-
-                # Table Header
-                h1, h2, h3, h4, h5 = st.columns([1.5, 2, 2.5, 2.5, 2.5])
-                h1.markdown("**Section of Email**")
-                h2.markdown("**Block Description**")
-                h3.markdown("**Visual Slice**")
-                h4.markdown("**Alt Text**")
-                h5.markdown("**ARIA Label**")
-                st.divider()
-
-                # Render Data Rows
+                
+                # --- GENERATE WORD DOC IN BACKGROUND ---
+                word_file = create_word_doc(a11y_data, image)
+                
+                # --- SHOW DOWNLOAD BUTTON ---
+                st.download_button(
+                    label="📄 Download as Word Document (Upload to Google Drive)",
+                    data=word_file,
+                    file_name="A11y_Documentation.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary"
+                )
+                
+                st.subheader("Preview:")
                 for row in a11y_data:
-                    c1, c2, c3, c4, c5 = st.columns([1.5, 2, 2.5, 2.5, 2.5])
+                    st.write(f"**{row.get('section')}** | {row.get('alt_text')} | {row.get('aria_label')}")
                     
-                    c1.write(row.get("section", "—"))
-                    c2.write(row.get("description", "—"))
-                    
-                    # Process & Display Image Slice
-                    box = row.get("box_2d")
-                    if box and len(box) == 4:
-                        ymin, xmin, ymax, xmax = box
-                        left = (xmin / 1000.0) * img_width
-                        top = (ymin / 1000.0) * img_height
-                        right = (xmax / 1000.0) * img_width
-                        bottom = (ymax / 1000.0) * img_height
-                        
-                        cropped_slice = image.crop((left, top, right, bottom))
-                        c3.image(cropped_slice, use_container_width=True)
-                    else:
-                        c3.write("—")
-
-                    c4.code(row.get("alt_text", "n/a"), language=None)
-                    c5.code(row.get("aria_label", "n/a"), language=None)
-                    st.divider()
-
             except Exception as e:
                 st.error(f"Failed to generate documentation: {str(e)}")
 
